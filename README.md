@@ -2,8 +2,6 @@
 
 This repository contains a React Native CLI Android application and a pnpm workspace foundation for the Field Reporting App.
 
-
-
 ## Project structure
 
 Monorepo Architecture
@@ -40,24 +38,26 @@ Build a debug APK:
 pnpm mobile:android:build
 ```
 
-
-
 Run the mobile TypeScript check:
 
 ```sh
 pnpm mobile:typecheck
 ```
 
+## API and infrastructure
 
-## API and infrastructure status
-
-The root API scripts target an `@field-reporting/api` workspace package with NestJS `start:dev`, `build`, and `test` scripts:
+The NestJS API uses Prisma and PostgreSQL. Start the database and API in separate terminals:
 
 ```sh
+docker compose up -d db
 pnpm api:dev
+```
+
+Set up the API's local environment once by copying `apps/api/.env.example` to `apps/api/.env`. Build and run the PostgreSQL-backed integration tests with:
+
+```sh
 pnpm api:build
 pnpm api:test
 ```
-
 
 

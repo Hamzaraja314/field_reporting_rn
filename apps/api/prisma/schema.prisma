@@ -1,0 +1,32 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Report {
+  id             String        @id @default(uuid()) @db.Uuid
+  idempotencyKey String        @unique @db.Uuid
+  fingerprint    String        @db.Char(64)
+  description    String        @db.Text
+  createdAt      DateTime      @default(now()) @db.Timestamptz(3)
+  images         ReportImage[]
+
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+}
+
+model ReportImage {
+  id         String @id @default(uuid()) @db.Uuid
+  reportId   String @db.Uuid
+  storageKey String @unique @db.VarChar(255)
+  mimeType   String @db.VarChar(64)
+  sizeBytes  Int
+  orderIndex Int
+  report     Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@unique([reportId, orderIndex])
+  @@index([reportId])
+}

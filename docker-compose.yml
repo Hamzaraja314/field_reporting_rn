@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: field_reporting
+      POSTGRES_USER: field_reporting
+      POSTGRES_PASSWORD: field_reporting
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U field_reporting -d field_reporting"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://field_reporting:field_reporting@db:5432/field_reporting?schema=public
+      PORT: 3000
+      UPLOAD_ROOT: /var/lib/field-reporting/uploads
+      FAILURE_INJECTION_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - report_uploads:/var/lib/field-reporting/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  postgres_data:
+  report_uploads:
