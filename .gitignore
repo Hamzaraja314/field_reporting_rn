@@ -1,0 +1,33 @@
+node_modules/
+
+# Build and test output
+dist/
+build/
+coverage/
+.cache/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+
+# Android local configuration and generated output
+**/android/local.properties
+**/android/.gradle/
+**/android/app/build/
+
+# iOS generated files (for React Native CLI)
+**/ios/Pods/
+**/ios/build/
+
+# Local databases and runtime uploads
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+tmp/
+temp/
+*.tmp
+*.temp

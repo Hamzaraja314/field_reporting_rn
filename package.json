@@ -1,0 +1,15 @@
+{
+  "name": "field-reporting",
+  "private": true,
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "api:dev": "pnpm --filter @field-reporting/api --fail-if-no-match run start:dev",
+    "api:build": "pnpm --filter @field-reporting/api --fail-if-no-match run build",
+    "api:test": "pnpm --filter @field-reporting/api --fail-if-no-match run test",
+    "mobile:start": "pnpm --filter com.fieldreporting.mobile start",
+    "mobile:android": "pnpm --filter com.fieldreporting.mobile android",
+    "mobile:android:build": "pnpm --filter com.fieldreporting.mobile android:build",
+    "mobile:typecheck": "pnpm --filter com.fieldreporting.mobile typecheck",
+    "workspace:check": "pnpm -r list --depth -1"
+  }
+}
