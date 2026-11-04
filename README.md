@@ -14,8 +14,6 @@ apps/
     App.tsx            Initial Field Reporting foundation screen
 packages/
   types/               Shared TypeScript contracts package
-docs/
-  architecture.md      Initial architecture and planned stages
 ```
 
 ## Mobile development
