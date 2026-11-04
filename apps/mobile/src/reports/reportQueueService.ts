@@ -23,12 +23,14 @@ export class ReportQueueService {
   async recordTransientFailure(
     reportId: string,
     message: string,
+    nextAttemptAt = new Date().toISOString(),
   ): Promise<LocalReport> {
     const lastError = requireFailureMessage(message);
     const report = await this.reports.getReport(reportId);
     return this.reports.transitionReport(reportId, 'retrying', {
       lastError,
       retryCount: report.retryCount + 1,
+      nextAttemptAt,
     });
   }
 
@@ -60,6 +62,10 @@ export class ReportQueueService {
 
   recoverInterruptedUploads(): Promise<number> {
     return this.reports.recoverInterruptedUploads();
+  }
+
+  retryFailedReport(reportId: string): Promise<LocalReport> {
+    return this.reports.retryFailedReport(reportId);
   }
 
   deleteUnsentReport(reportId: string): Promise<void> {

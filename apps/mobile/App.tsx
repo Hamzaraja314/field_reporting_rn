@@ -5,6 +5,7 @@ import {
   Image,
   Linking,
   Pressable,
+  RefreshControl,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -22,6 +23,7 @@ import {
   reportImagePicker,
   reportQueueService,
   reportRepository,
+  reportUploadCoordinator,
 } from './src/localReports';
 import type { LocalReport } from './src/reports/model';
 import { MAX_REPORT_IMAGES } from './src/images/imageLimits';
@@ -31,7 +33,9 @@ function App() {
   const [description, setDescription] = useState('');
   const [draftId, setDraftId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [retryingReportId, setRetryingReportId] = useState<string | null>(null);
   const [processing, setProcessing] = useState(false);
   const [processingProgress, setProcessingProgress] = useState<{
     completed: number;
@@ -41,10 +45,31 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const imageActionLocked = useRef(false);
+  const refreshActionLocked = useRef(false);
 
   const refreshReports = useCallback(async () => {
     setReports(await reportRepository.listReports());
   }, []);
+
+  const refreshAll = async () => {
+    if (refreshActionLocked.current) {
+      return;
+    }
+    refreshActionLocked.current = true;
+    setRefreshing(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await initializeLocalReports();
+      await reportUploadCoordinator.scan({ retryImmediately: true });
+      await refreshReports();
+    } catch (refreshError) {
+      setError(errorMessage(refreshError));
+    } finally {
+      refreshActionLocked.current = false;
+      setRefreshing(false);
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -81,6 +106,19 @@ function App() {
       subscription.remove();
     };
   }, []);
+
+  useEffect(
+    () =>
+      reportUploadCoordinator.subscribe(uploadError => {
+        if (uploadError) {
+          setError(`Upload queue: ${uploadError}`);
+        }
+        refreshReports().catch(refreshError => {
+          setError(errorMessage(refreshError));
+        });
+      }),
+    [refreshReports],
+  );
 
   const currentDraft = useMemo(
     () => reports.find(report => report.localId === draftId),
@@ -130,11 +168,32 @@ function App() {
       setDraftId(null);
       setDescription('');
       await refreshReports();
-      setNotice('Report queued for a future upload.');
+      setNotice(
+        'Report saved in the local queue. It will upload when a connection is available.',
+      );
+      reportUploadCoordinator.scan().catch(scanError => {
+        setError(errorMessage(scanError));
+      });
     } catch (queueError) {
       setError(errorMessage(queueError));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const retryFailedReport = async (reportId: string) => {
+    if (retryingReportId) {
+      return;
+    }
+    setRetryingReportId(reportId);
+    setError(null);
+    setNotice(null);
+    try {
+      await reportUploadCoordinator.retryFailedReport(reportId);
+    } catch (retryError) {
+      setError(errorMessage(retryError));
+    } finally {
+      setRetryingReportId(null);
     }
   };
 
@@ -277,7 +336,16 @@ function App() {
       <SafeAreaView style={styles.safeArea}>
         <ScrollView
           contentContainerStyle={styles.container}
-          keyboardShouldPersistTaps="handled">
+          keyboardShouldPersistTaps="handled"
+          refreshControl={
+            <RefreshControl
+              accessibilityLabel="Refresh reports and retry uploads"
+              colors={['#397B68']}
+              onRefresh={refreshAll}
+              refreshing={refreshing}
+              tintColor="#397B68"
+            />
+          }>
           <View style={styles.brand}>
             <View style={styles.brandMark}>
               <Text style={styles.brandMarkText}>F</Text>
@@ -292,7 +360,8 @@ function App() {
             <Text style={styles.eyebrow}>FIELD OPERATIONS</Text>
             <Text style={styles.title}>Field Reporting</Text>
             <Text style={styles.subtitle}>
-              Save report drafts securely on this device.
+              Reports are saved on this device and upload automatically when
+              the app is open and a connection is available.
             </Text>
           </View>
 
@@ -468,42 +537,58 @@ function App() {
           ) : (
             <View style={styles.reportList}>
               {reports.map(report => (
-                <Pressable
-                  accessibilityRole={
-                    report.status === 'draft' ? 'button' : undefined
-                  }
+                <View
                   key={report.localId}
-                  onPress={() => editDraft(report)}
                   style={[
                     styles.reportCard,
                     report.localId === draftId && styles.selectedReport,
                   ]}>
-                  <View style={styles.reportTopLine}>
-                    <Text
-                      numberOfLines={1}
-                      style={styles.reportDescription}>
-                      {report.description.trim() || 'Untitled draft'}
+                  <Pressable
+                    accessibilityRole={
+                      report.status === 'draft' ? 'button' : undefined
+                    }
+                    disabled={report.status !== 'draft'}
+                    onPress={() => editDraft(report)}>
+                    <View style={styles.reportTopLine}>
+                      <Text
+                        numberOfLines={1}
+                        style={styles.reportDescription}>
+                        {report.description.trim() || 'Untitled draft'}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.status,
+                          statusStyles[report.status],
+                        ]}>
+                        {report.status}
+                      </Text>
+                    </View>
+                    <Text style={styles.reportMeta}>
+                      {report.images.length}{' '}
+                      {report.images.length === 1 ? 'image' : 'images'} ·{' '}
+                      {new Date(report.createdAt).toLocaleString()}
                     </Text>
-                    <Text
-                      style={[
-                        styles.status,
-                        statusStyles[report.status],
-                      ]}>
-                      {report.status}
-                    </Text>
-                  </View>
-                  <Text style={styles.reportMeta}>
-                    {report.images.length}{' '}
-                    {report.images.length === 1 ? 'image' : 'images'} ·{' '}
-                    {new Date(report.createdAt).toLocaleString()}
-                  </Text>
-                  {report.status === 'draft' ? (
-                    <Text style={styles.editHint}>Tap to edit this draft</Text>
+                    {report.status === 'draft' ? (
+                      <Text style={styles.editHint}>Tap to edit this draft</Text>
+                    ) : null}
+                    {report.lastError ? (
+                      <Text style={styles.reportError}>{report.lastError}</Text>
+                    ) : null}
+                  </Pressable>
+                  {report.status === 'failed' ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      disabled={retryingReportId !== null}
+                      onPress={() => retryFailedReport(report.localId)}
+                      style={styles.retryButton}>
+                      <Text style={styles.retryButtonLabel}>
+                        {retryingReportId === report.localId
+                          ? 'Retrying…'
+                          : 'Retry upload'}
+                      </Text>
+                    </Pressable>
                   ) : null}
-                  {report.lastError ? (
-                    <Text style={styles.reportError}>{report.lastError}</Text>
-                  ) : null}
-                </Pressable>
+                </View>
               ))}
             </View>
           )}
@@ -812,6 +897,19 @@ const styles = StyleSheet.create({
     borderColor: '#E1E9E5',
     borderRadius: 14,
     backgroundColor: '#FFFFFF',
+  },
+  retryButton: {
+    alignSelf: 'flex-start',
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 9,
+    backgroundColor: '#FCE9E7',
+  },
+  retryButtonLabel: {
+    color: '#A73D35',
+    fontSize: 13,
+    fontWeight: '700',
   },
   selectedReport: {
     borderColor: '#6A9B88',

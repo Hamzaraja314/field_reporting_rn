@@ -6,6 +6,10 @@ import { Image, Platform } from 'react-native';
 import { createLocalUuid } from '../ids';
 import type { LocalImageInput } from '../storage/imageStorage';
 import {
+  copyImageUriToPath,
+  ImageUriCopyError,
+} from '../storage/imageUriCopy';
+import {
   isSupportedImageMimeType,
   MAX_IMAGE_DIMENSION,
   MAX_IMAGE_SIZE_BYTES,
@@ -67,25 +71,26 @@ const defaultFileSystem: ImageProcessingFileSystem = {
     if (!(await ReactNativeBlobUtil.fs.exists(temporaryDirectory))) {
       await ReactNativeBlobUtil.fs.mkdir(temporaryDirectory);
     }
+    if (!(await ReactNativeBlobUtil.fs.exists(temporaryDirectory))) {
+      throw new Error('The private image processing directory is unavailable.');
+    }
   },
   async copyToTemporary(sourceUri, destinationPath) {
-    const sourcePath = sourceUri.startsWith('file://')
-      ? decodeURIComponent(sourceUri.slice('file://'.length))
-      : sourceUri;
-    if (sourcePath.startsWith('content://')) {
-      await ReactNativeBlobUtil.MediaCollection.copyToInternal(
-        sourcePath,
-        destinationPath,
-      );
-      return;
-    }
-    if (!sourcePath.startsWith('/')) {
-      throw new Error('The selected image does not have a valid local URI.');
-    }
-    const copied = await ReactNativeBlobUtil.fs.cp(sourcePath, destinationPath);
-    if (!copied) {
-      throw new Error('The selected image could not be copied for processing.');
-    }
+    await copyImageUriToPath(sourceUri, destinationPath, {
+      copyFile: (source, destination) =>
+        ReactNativeBlobUtil.fs.cp(source, destination),
+      copyContentUri: (source, destination) =>
+        ReactNativeBlobUtil.MediaCollection.copyToInternal(
+          source,
+          destination,
+        ),
+      exists: path => ReactNativeBlobUtil.fs.exists(path),
+      remove: async path => {
+        if (await ReactNativeBlobUtil.fs.exists(path)) {
+          await ReactNativeBlobUtil.fs.unlink(path);
+        }
+      },
+    });
   },
   async stat(path) {
     const file = await ReactNativeBlobUtil.fs.stat(path);
@@ -171,8 +176,15 @@ export class ImageProcessingService {
 
     const cleanupError = await this.cleanupFiles();
     if (cleanupError) {
+      if (__DEV__) {
+        console.warn(
+          '[image-processing] Temporary image cleanup failed',
+          cleanupError,
+          operationError,
+        );
+      }
       throw new Error(
-        `Image operation failed and temporary image cleanup was incomplete: ${messageOf(cleanupError)}${operationError ? ` (operation error: ${messageOf(operationError)})` : ''}`,
+        'Temporary image cleanup failed. Restart the app before trying again.',
       );
     }
     if (operationError) {
@@ -187,8 +199,11 @@ export class ImageProcessingService {
   async cleanupTemporaryFiles(): Promise<void> {
     const error = await this.cleanupFiles();
     if (error) {
+      if (__DEV__) {
+        console.warn('[image-processing] Startup cleanup failed', error);
+      }
       throw new Error(
-        `Temporary image files could not be cleaned: ${messageOf(error)}`,
+        'Temporary image files could not be cleaned. Restart the app before trying again.',
       );
     }
   }
@@ -220,8 +235,8 @@ export class ImageProcessingService {
 
     const extension = extensionForMimeType(mimeType);
     const sourcePath = `${this.dependencies.fileSystem.temporaryDirectory()}/${this.dependencies.createId()}.${extension}`;
-    await this.dependencies.fileSystem.ensureTemporaryDirectory();
     try {
+      await this.dependencies.fileSystem.ensureTemporaryDirectory();
       await this.dependencies.fileSystem.copyToTemporary(input.uri, sourcePath);
       const sourceInfo = await this.dependencies.fileSystem.stat(sourcePath);
       if (!Number.isSafeInteger(sourceInfo.sizeBytes) || sourceInfo.sizeBytes < 1) {
@@ -262,6 +277,12 @@ export class ImageProcessingService {
         onProgress,
       });
     } catch (error) {
+      if (__DEV__) {
+        console.warn('[image-processing] Unable to process selected image', error);
+      }
+      if (error instanceof ImageUriCopyError) {
+        throw new Error(`${displayName(input, index)}: ${error.message}`);
+      }
       throw new Error(
         `${displayName(input, index)}: ${readableProcessingError(error)}`,
       );
@@ -433,7 +454,14 @@ function readableProcessingError(error: unknown): string {
   if (/could not be decoded|decode|corrupt|invalid image/i.test(message)) {
     return 'This image is corrupt or cannot be decoded. Choose another image.';
   }
-  return message;
+  if (
+    /still 5 MiB or larger|empty or has an invalid size|invalid dimensions|processor did not create|processed image is empty|format did not match/i.test(
+      message,
+    )
+  ) {
+    return message;
+  }
+  return 'This image could not be processed. Choose another image and try again.';
 }
 
 function messageOf(error: unknown): string {

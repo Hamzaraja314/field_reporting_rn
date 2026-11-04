@@ -11,6 +11,8 @@ export interface SelectedReportImage {
   uri: string;
   mimeType?: string;
   fileName?: string;
+  fileSize?: number;
+  originalPath?: string;
 }
 
 export type ImageSelection =
@@ -114,6 +116,8 @@ function mapPickerResponse(response: ImagePickerResponse): ImageSelection {
       uri: asset.uri,
       mimeType: asset.type ?? mimeTypeFromFileName(asset.fileName),
       fileName: asset.fileName,
+      fileSize: asset.fileSize,
+      originalPath: asset.originalPath,
     }));
   return images.length > 0
     ? { kind: 'selected', images }

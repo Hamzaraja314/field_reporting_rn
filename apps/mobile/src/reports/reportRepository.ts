@@ -23,11 +23,13 @@ import {
 interface StateRow {
   status: ReportStatus;
   retryCount: number;
+  uploadAttemptCount: number;
 }
 
 export interface ReportStatusUpdate {
   lastError?: string | null;
   retryCount?: number;
+  nextAttemptAt?: string | null;
   serverReportId?: string | null;
   uploadedAt?: string | null;
 }
@@ -41,6 +43,9 @@ const reportSelect = `SELECT
     r.status,
     r.last_error,
     r.retry_count,
+    r.upload_attempt_count,
+    r.upload_started_at,
+    r.next_attempt_at,
     r.server_report_id,
     r.uploaded_at,
     i.local_id AS image_local_id,
@@ -271,6 +276,9 @@ export class LocalReportRepository {
     await database.transaction(async transaction => {
       this.assertImagesNotProcessing(reportId);
       const report = await this.getQueueFields(transaction, reportId);
+      if (report.status !== 'draft') {
+        throw new ReportValidationError('Only a draft report can be queued.');
+      }
       assertQueueableReport(report.description, report.imageCount);
       assertReportTransition(report.status, 'queued');
       const imageResult = await transaction.execute(
@@ -326,6 +334,12 @@ export class LocalReportRepository {
       const lastError =
         update.lastError === undefined ? null : update.lastError;
       const retryCount = update.retryCount ?? current.retryCount;
+      const uploadAttemptCount =
+        current.uploadAttemptCount + (nextStatus === 'uploading' ? 1 : 0);
+      const changedAt = this.now();
+      const uploadStartedAt =
+        nextStatus === 'uploading' ? changedAt : null;
+      const nextAttemptAt = update.nextAttemptAt ?? null;
       const serverReportId = update.serverReportId ?? null;
       const uploadedAt = update.uploadedAt ?? null;
       if (
@@ -340,13 +354,17 @@ export class LocalReportRepository {
       const result = await transaction.execute(
         `UPDATE reports SET
            status = ?, updated_at = ?, last_error = ?, retry_count = ?,
+           upload_attempt_count = ?, upload_started_at = ?, next_attempt_at = ?,
            server_report_id = ?, uploaded_at = ?
          WHERE local_id = ? AND status = ?`,
         [
           nextStatus,
-          this.now(),
+          changedAt,
           lastError,
           retryCount,
+          uploadAttemptCount,
+          uploadStartedAt,
+          nextAttemptAt,
           serverReportId,
           uploadedAt,
           reportId,
@@ -373,7 +391,8 @@ export class LocalReportRepository {
         assertReportTransition(status, 'retrying');
         const updateResult = await transaction.execute(
           `UPDATE reports SET status = 'retrying', last_error = ?,
-           updated_at = ? WHERE local_id = ? AND status = 'uploading'`,
+             next_attempt_at = NULL, upload_started_at = NULL,
+             updated_at = ? WHERE local_id = ? AND status = 'uploading'`,
           [
             'Upload was interrupted before completion.',
             this.now(),
@@ -388,6 +407,25 @@ export class LocalReportRepository {
       }
     });
     return recoveredCount;
+  }
+
+  async retryFailedReport(reportId: string): Promise<LocalReport> {
+    const database = await this.databaseProvider();
+    await database.transaction(async transaction => {
+      const current = await this.getState(transaction, reportId);
+      assertReportTransition(current.status, 'queued');
+      const result = await transaction.execute(
+        `UPDATE reports SET status = 'queued', last_error = NULL,
+           next_attempt_at = NULL, upload_started_at = NULL, updated_at = ?
+         WHERE local_id = ? AND status = 'failed'`,
+        [this.now(), reportId],
+      );
+      this.assertOneRowChanged(
+        result.rowsAffected,
+        'Failed report could not be queued for manual retry.',
+      );
+    });
+    return this.getReport(reportId);
   }
 
   async replaceImageFile(
@@ -575,7 +613,8 @@ export class LocalReportRepository {
     reportId: string,
   ): Promise<StateRow> {
     const result = await transaction.execute(
-      'SELECT status, retry_count FROM reports WHERE local_id = ?',
+      `SELECT status, retry_count, upload_attempt_count
+       FROM reports WHERE local_id = ?`,
       [reportId],
     );
     const row = result.rows[0];
@@ -585,6 +624,7 @@ export class LocalReportRepository {
     return {
       status: statusField(row, 'status'),
       retryCount: numberField(row, 'retry_count'),
+      uploadAttemptCount: numberField(row, 'upload_attempt_count'),
     };
   }
 
@@ -687,6 +727,9 @@ function mapReports(rows: Record<string, Scalar>[]): LocalReport[] {
         status: statusField(row, 'status'),
         lastError: nullableStringField(row, 'last_error'),
         retryCount: numberField(row, 'retry_count'),
+        uploadAttemptCount: numberField(row, 'upload_attempt_count'),
+        uploadStartedAt: nullableStringField(row, 'upload_started_at'),
+        nextAttemptAt: nullableStringField(row, 'next_attempt_at'),
         serverReportId: nullableStringField(row, 'server_report_id'),
         uploadedAt: nullableStringField(row, 'uploaded_at'),
         images: [],

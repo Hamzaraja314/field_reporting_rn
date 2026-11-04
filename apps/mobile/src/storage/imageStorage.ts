@@ -1,6 +1,10 @@
 import ReactNativeBlobUtil from 'react-native-blob-util';
 import { createLocalUuid } from '../ids';
 import { MAX_IMAGE_SIZE_BYTES } from '../images/imageLimits';
+import {
+  copyImageUriToPath,
+  ImageUriCopyError,
+} from './imageUriCopy';
 
 export interface LocalImageInput {
   uri: string;
@@ -40,10 +44,10 @@ export class LocalImageStorage implements ImageStorage {
       throw new Error('Only JPEG, PNG, and WebP images can be stored.');
     }
 
-    await this.ensureDirectory();
     const filePath = `${this.directory}/${createLocalUuid()}.${extension}`;
 
     try {
+      await this.ensureDirectory();
       await this.copyIntoPrivateStorage(input.uri, filePath);
       const file = await ReactNativeBlobUtil.fs.stat(filePath);
       const sizeBytes = Number(file.size);
@@ -60,8 +64,36 @@ export class LocalImageStorage implements ImageStorage {
       );
       return { filePath, sizeBytes, contentHash };
     } catch (error) {
-      await this.cleanupFailedCopy(filePath, error);
-      throw error;
+      if (__DEV__) {
+        console.warn('[image-storage] Unable to persist selected image', error);
+      }
+      try {
+        await this.cleanupFailedCopy(filePath, error);
+      } catch (cleanupError) {
+        if (__DEV__) {
+          console.warn(
+            '[image-storage] Partial image cleanup failed',
+            cleanupError,
+          );
+        }
+        throw new Error(
+          'The image could not be saved and a partial file could not be cleaned up. Restart the app before retrying.',
+        );
+      }
+      if (error instanceof ImageUriCopyError) {
+        throw new Error(error.message);
+      }
+      const message = error instanceof Error ? error.message : '';
+      if (
+        /smaller than 5 MiB|empty or has an invalid size|Only JPEG, PNG, and WebP/i.test(
+          message,
+        )
+      ) {
+        throw error;
+      }
+      throw new Error(
+        'The image could not be saved to private storage. Please retry.',
+      );
     }
   }
 
@@ -107,6 +139,9 @@ export class LocalImageStorage implements ImageStorage {
         if (!(await ReactNativeBlobUtil.fs.exists(this.directory))) {
           await ReactNativeBlobUtil.fs.mkdir(this.directory);
         }
+        if (!(await ReactNativeBlobUtil.fs.exists(this.directory))) {
+          throw new Error('Private report image storage is unavailable.');
+        }
       })().catch(error => {
         this.directoryPromise = undefined;
         throw error;
@@ -119,25 +154,21 @@ export class LocalImageStorage implements ImageStorage {
     sourceUri: string,
     destinationPath: string,
   ): Promise<void> {
-    if (sourceUri.startsWith('content://')) {
-      await ReactNativeBlobUtil.MediaCollection.copyToInternal(
-        sourceUri,
-        destinationPath,
-      );
-      return;
-    }
-
-    const sourcePath = sourceUri.startsWith('file://')
-      ? decodeURIComponent(sourceUri.slice('file://'.length))
-      : sourceUri;
-    if (!sourcePath.startsWith('/')) {
-      throw new Error('Image URI must be a local file or content URI.');
-    }
-
-    const copied = await ReactNativeBlobUtil.fs.cp(sourcePath, destinationPath);
-    if (!copied) {
-      throw new Error('The selected image could not be copied.');
-    }
+    await copyImageUriToPath(sourceUri, destinationPath, {
+      copyFile: (source, destination) =>
+        ReactNativeBlobUtil.fs.cp(source, destination),
+      copyContentUri: (source, destination) =>
+        ReactNativeBlobUtil.MediaCollection.copyToInternal(
+          source,
+          destination,
+        ),
+      exists: path => ReactNativeBlobUtil.fs.exists(path),
+      remove: async path => {
+        if (await ReactNativeBlobUtil.fs.exists(path)) {
+          await ReactNativeBlobUtil.fs.unlink(path);
+        }
+      },
+    });
   }
 
   private assertManagedPath(filePath: string): void {

@@ -30,6 +30,9 @@ export interface LocalReport {
   status: ReportStatus;
   lastError: string | null;
   retryCount: number;
+  uploadAttemptCount: number;
+  uploadStartedAt: string | null;
+  nextAttemptAt: string | null;
   serverReportId: string | null;
   uploadedAt: string | null;
   images: LocalReportImage[];
@@ -48,7 +51,7 @@ const legalTransitions: Record<ReportStatus, readonly ReportStatus[]> = {
   uploading: ['retrying', 'uploaded', 'failed'],
   retrying: ['uploading', 'uploaded', 'failed'],
   uploaded: [],
-  failed: [],
+  failed: ['queued'],
 };
 
 export function isReportStatus(value: unknown): value is ReportStatus {

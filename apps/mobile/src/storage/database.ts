@@ -38,6 +38,16 @@ const migrations = [
       'CREATE INDEX report_images_report_id_idx ON report_images(report_id)',
     ],
   },
+  {
+    version: 2,
+    statements: [
+      `ALTER TABLE reports ADD COLUMN upload_attempt_count
+       INTEGER NOT NULL DEFAULT 0 CHECK (upload_attempt_count >= 0)`,
+      'ALTER TABLE reports ADD COLUMN upload_started_at TEXT',
+      'ALTER TABLE reports ADD COLUMN next_attempt_at TEXT',
+      'CREATE INDEX reports_next_attempt_idx ON reports(status, next_attempt_at)',
+    ],
+  },
 ] as const;
 
 export async function migrateDatabase(database: DB): Promise<void> {

@@ -4,6 +4,7 @@ import { LocalReportRepository } from './reports/reportRepository';
 import { ReportQueueService } from './reports/reportQueueService';
 import { ImageProcessingService } from './images/imageProcessing';
 import { ReportImagePicker } from './images/reportImagePicker';
+import { ReportUploadCoordinator } from './reports/reportUploadCoordinator';
 
 const imageStorage = new LocalImageStorage();
 
@@ -11,6 +12,10 @@ export const reportRepository = new LocalReportRepository(imageStorage);
 export const reportQueueService = new ReportQueueService(reportRepository);
 export const reportImagePicker = new ReportImagePicker();
 export const imageProcessingService = new ImageProcessingService();
+export const reportUploadCoordinator = new ReportUploadCoordinator(
+  reportQueueService,
+  imageStorage,
+);
 
 let initialization: Promise<void> | undefined;
 
@@ -21,6 +26,7 @@ export async function initializeLocalReports(): Promise<void> {
       await imageProcessingService.cleanupTemporaryFiles();
       await reportRepository.cleanupOrphanedImages();
       await reportQueueService.recoverInterruptedUploads();
+      reportUploadCoordinator.start();
     })().catch(error => {
       initialization = undefined;
       throw error;
