@@ -14,6 +14,11 @@ import {
   type LocalReport,
   type ReportStatus,
 } from './model';
+import {
+  isSupportedImageMimeType,
+  MAX_IMAGE_SIZE_BYTES,
+  MAX_REPORT_IMAGES,
+} from '../images/imageLimits';
 
 interface StateRow {
   status: ReportStatus;
@@ -51,6 +56,8 @@ const reportSelect = `SELECT
   LEFT JOIN report_images i ON i.report_id = r.local_id`;
 
 export class LocalReportRepository {
+  private readonly processingReports = new Set<string>();
+
   constructor(
     private readonly imageStorage: ImageStorage,
     private readonly databaseProvider: () => Promise<DB> = getLocalDatabase,
@@ -99,7 +106,7 @@ export class LocalReportRepository {
 
     const existing = await this.getReport(reportId);
     this.assertDraft(existing.status);
-    if (existing.images.length + inputs.length > 5) {
+    if (existing.images.length + inputs.length > MAX_REPORT_IMAGES) {
       throw new ReportValidationError(
         'A report can include no more than five images.',
       );
@@ -117,10 +124,29 @@ export class LocalReportRepository {
         const state = await this.getState(transaction, reportId);
         this.assertDraft(state.status);
         const imageCount = await this.getImageCount(transaction, reportId);
-        if (imageCount + inputs.length > 5) {
+        if (imageCount + inputs.length > MAX_REPORT_IMAGES) {
           throw new ReportValidationError(
             'A report can include no more than five images.',
           );
+        }
+
+        const existingHashes = await transaction.execute(
+          `SELECT content_hash FROM report_images
+           WHERE report_id = ? AND content_hash IS NOT NULL`,
+          [reportId],
+        );
+        const contentHashes = new Set(
+          existingHashes.rows.map(row => stringField(row, 'content_hash')),
+        );
+        for (const file of copiedFiles) {
+          if (file.contentHash && contentHashes.has(file.contentHash)) {
+            throw new ReportValidationError(
+              'This image is already attached to the report.',
+            );
+          }
+          if (file.contentHash) {
+            contentHashes.add(file.contentHash);
+          }
         }
 
         for (let index = 0; index < inputs.length; index += 1) {
@@ -240,20 +266,41 @@ export class LocalReportRepository {
   }
 
   async queueReport(reportId: string): Promise<LocalReport> {
+    this.assertImagesNotProcessing(reportId);
     const database = await this.databaseProvider();
     await database.transaction(async transaction => {
+      this.assertImagesNotProcessing(reportId);
       const report = await this.getQueueFields(transaction, reportId);
       assertQueueableReport(report.description, report.imageCount);
       assertReportTransition(report.status, 'queued');
       const imageResult = await transaction.execute(
-        'SELECT file_path FROM report_images WHERE report_id = ? ORDER BY order_index',
+        `SELECT file_path, size_bytes, mime_type
+         FROM report_images WHERE report_id = ? ORDER BY order_index`,
         [reportId],
       );
       for (const row of imageResult.rows) {
         const filePath = stringField(row, 'file_path');
+        const sizeBytes = numberField(row, 'size_bytes');
+        const mimeType = stringField(row, 'mime_type');
+        if (
+          !isSupportedImageMimeType(mimeType) ||
+          sizeBytes < 1 ||
+          sizeBytes >= MAX_IMAGE_SIZE_BYTES ||
+          !imagePathMatchesMimeType(filePath, mimeType)
+        ) {
+          throw new ReportValidationError(
+            'Every attached image must be a supported format and smaller than 5 MiB.',
+          );
+        }
         if (!(await this.imageStorage.fileExists(filePath))) {
           throw new ReportValidationError(
             'A saved image is missing from private storage; this report cannot be queued.',
+          );
+        }
+        const actualSize = await this.imageStorage.fileSize(filePath);
+        if (actualSize !== sizeBytes || actualSize >= MAX_IMAGE_SIZE_BYTES) {
+          throw new ReportValidationError(
+            'A saved image changed or is no longer below the 5 MiB limit.',
           );
         }
       }
@@ -393,6 +440,61 @@ export class LocalReportRepository {
     return this.getReport(reportId);
   }
 
+  async removeImage(reportId: string, imageId: string): Promise<LocalReport> {
+    this.assertImagesNotProcessing(reportId);
+    const database = await this.databaseProvider();
+    let filePath = '';
+    await database.transaction(async transaction => {
+      const state = await this.getState(transaction, reportId);
+      this.assertDraft(state.status);
+      const imageResult = await transaction.execute(
+        `SELECT file_path FROM report_images
+         WHERE report_id = ? AND local_id = ?`,
+        [reportId, imageId],
+      );
+      const image = imageResult.rows[0];
+      if (!image) {
+        throw new Error('Local report image was not found.');
+      }
+      filePath = stringField(image, 'file_path');
+      const deleteResult = await transaction.execute(
+        'DELETE FROM report_images WHERE report_id = ? AND local_id = ?',
+        [reportId, imageId],
+      );
+      this.assertOneRowChanged(
+        deleteResult.rowsAffected,
+        'Local report image was not removed.',
+      );
+
+      const remainingImages = await transaction.execute(
+        `SELECT local_id FROM report_images
+         WHERE report_id = ? ORDER BY order_index`,
+        [reportId],
+      );
+      await transaction.execute(
+        'UPDATE report_images SET order_index = order_index + 5 WHERE report_id = ?',
+        [reportId],
+      );
+      for (let index = 0; index < remainingImages.rows.length; index += 1) {
+        await transaction.execute(
+          `UPDATE report_images SET order_index = ?
+           WHERE report_id = ? AND local_id = ?`,
+          [
+            index,
+            reportId,
+            stringField(remainingImages.rows[index], 'local_id'),
+          ],
+        );
+      }
+      await transaction.execute(
+        'UPDATE reports SET updated_at = ? WHERE local_id = ?',
+        [this.now(), reportId],
+      );
+    });
+    await this.removeIfUnreferenced([filePath]);
+    return this.getReport(reportId);
+  }
+
   async deleteUnsentReport(reportId: string): Promise<void> {
     const database = await this.databaseProvider();
     let filePaths: string[] = [];
@@ -443,6 +545,29 @@ export class LocalReportRepository {
       result.rows.map(row => stringField(row, 'file_path')),
     );
     await this.imageStorage.removeOrphanedFiles(referencedPaths);
+  }
+
+  async beginImageProcessing(reportId: string): Promise<void> {
+    if (this.processingReports.has(reportId)) {
+      throw new ReportValidationError(
+        'Images are already being processed for this report.',
+      );
+    }
+    const report = await this.getReport(reportId);
+    this.assertDraft(report.status);
+    this.processingReports.add(reportId);
+  }
+
+  endImageProcessing(reportId: string): void {
+    this.processingReports.delete(reportId);
+  }
+
+  private assertImagesNotProcessing(reportId: string): void {
+    if (this.processingReports.has(reportId)) {
+      throw new ReportValidationError(
+        'Wait for image processing to finish before queueing this report.',
+      );
+    }
   }
 
   private async getState(
@@ -632,4 +757,13 @@ function statusField(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function imagePathMatchesMimeType(filePath: string, mimeType: string): boolean {
+  const extension = filePath.toLowerCase().split('.').pop();
+  return mimeType === 'image/jpeg'
+    ? extension === 'jpg' || extension === 'jpeg'
+    : mimeType === 'image/png'
+      ? extension === 'png'
+      : extension === 'webp';
 }

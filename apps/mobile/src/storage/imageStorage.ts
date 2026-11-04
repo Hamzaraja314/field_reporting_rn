@@ -1,5 +1,6 @@
 import ReactNativeBlobUtil from 'react-native-blob-util';
 import { createLocalUuid } from '../ids';
+import { MAX_IMAGE_SIZE_BYTES } from '../images/imageLimits';
 
 export interface LocalImageInput {
   uri: string;
@@ -16,6 +17,7 @@ export interface StoredImageFile {
 export interface ImageStorage {
   copyImage(input: LocalImageInput): Promise<StoredImageFile>;
   fileExists(filePath: string): Promise<boolean>;
+  fileSize(filePath: string): Promise<number>;
   removeFile(filePath: string): Promise<void>;
   removeOrphanedFiles(referencedPaths: ReadonlySet<string>): Promise<void>;
 }
@@ -48,6 +50,9 @@ export class LocalImageStorage implements ImageStorage {
       if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1) {
         throw new Error('The selected image is empty or has an invalid size.');
       }
+      if (sizeBytes >= MAX_IMAGE_SIZE_BYTES) {
+        throw new Error('Images must be smaller than 5 MiB before they are attached.');
+      }
 
       const contentHash = await ReactNativeBlobUtil.fs.hash(
         filePath,
@@ -63,6 +68,16 @@ export class LocalImageStorage implements ImageStorage {
   async fileExists(filePath: string): Promise<boolean> {
     this.assertManagedPath(filePath);
     return ReactNativeBlobUtil.fs.exists(filePath);
+  }
+
+  async fileSize(filePath: string): Promise<number> {
+    this.assertManagedPath(filePath);
+    const file = await ReactNativeBlobUtil.fs.stat(filePath);
+    const sizeBytes = Number(file.size);
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1) {
+      throw new Error('A saved image has an invalid file size.');
+    }
+    return sizeBytes;
   }
 
   async removeFile(filePath: string): Promise<void> {

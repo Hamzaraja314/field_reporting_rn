@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   AppState,
+  Image,
+  Linking,
   Pressable,
   ScrollView,
   StatusBar,
@@ -16,10 +18,13 @@ import {
 } from 'react-native-safe-area-context';
 import {
   initializeLocalReports,
+  imageProcessingService,
+  reportImagePicker,
   reportQueueService,
   reportRepository,
 } from './src/localReports';
 import type { LocalReport } from './src/reports/model';
+import { MAX_REPORT_IMAGES } from './src/images/imageLimits';
 
 function App() {
   const [reports, setReports] = useState<LocalReport[]>([]);
@@ -27,8 +32,15 @@ function App() {
   const [draftId, setDraftId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState<{
+    completed: number;
+    total: number;
+  } | null>(null);
+  const [cameraPermissionDenied, setCameraPermissionDenied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const imageActionLocked = useRef(false);
 
   const refreshReports = useCallback(async () => {
     setReports(await reportRepository.listReports());
@@ -79,7 +91,12 @@ function App() {
     Boolean(draftId) &&
     Boolean(description.trim()) &&
     imageCount >= 1 &&
-    imageCount <= 5;
+    imageCount <= MAX_REPORT_IMAGES &&
+    !processing;
+  const formBusy = saving || processing || loading;
+  const imageActionsDisabled =
+    formBusy || !draftId || imageCount >= MAX_REPORT_IMAGES;
+  const queueDisabled = !canQueue || formBusy;
 
   const saveDraft = async () => {
     setSaving(true);
@@ -118,6 +135,122 @@ function App() {
       setError(errorMessage(queueError));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const selectImages = async (source: 'camera' | 'gallery') => {
+    if (imageActionLocked.current || saving || loading) {
+      return;
+    }
+    if (!draftId) {
+      setError('Save a draft locally before adding images.');
+      return;
+    }
+    const remaining = MAX_REPORT_IMAGES - imageCount;
+    if (remaining < 1) {
+      setError('This report already has the maximum of five images.');
+      return;
+    }
+
+    imageActionLocked.current = true;
+    setProcessing(true);
+    setProcessingProgress(null);
+    setError(null);
+    setNotice(null);
+    try {
+      const selection =
+        source === 'camera'
+          ? await reportImagePicker.takePhoto()
+          : await reportImagePicker.chooseFromGallery(remaining);
+      if (selection.kind === 'cancelled') {
+        if (source === 'camera') {
+          setCameraPermissionDenied(false);
+        }
+        return;
+      }
+      if (selection.kind === 'permission-denied') {
+        setCameraPermissionDenied(source === 'camera');
+        setError(
+          source === 'camera'
+            ? 'Camera permission was denied. Allow Camera access in Settings, return here, and try again.'
+            : 'Photo selection access was denied. Review this app’s access in Settings and try again.',
+        );
+        return;
+      }
+      if (source === 'camera') {
+        setCameraPermissionDenied(false);
+      }
+      if (selection.kind === 'error') {
+        setError(selection.message);
+        return;
+      }
+      if (selection.images.length > remaining) {
+        setError(
+          `Select no more than ${remaining} additional ${remaining === 1 ? 'image' : 'images'}.`,
+        );
+        return;
+      }
+
+      setProcessingProgress({ completed: 0, total: selection.images.length });
+      await reportRepository.beginImageProcessing(draftId);
+      try {
+        await imageProcessingService.processAndUse(
+          selection.images.map(image => ({
+            uri: image.uri,
+            mimeType: image.mimeType ?? '',
+            originalFileName: image.fileName ?? null,
+          })),
+          async processedImages => {
+            await reportRepository.attachImages(
+              draftId,
+              processedImages.map(image => ({
+                uri: image.uri,
+                mimeType: image.mimeType,
+                originalFileName: image.originalFileName,
+              })),
+            );
+          },
+          progress => setProcessingProgress(progress),
+        );
+      } finally {
+        reportRepository.endImageProcessing(draftId);
+      }
+      await refreshReports();
+      setNotice(
+        `${selection.images.length} ${selection.images.length === 1 ? 'image was' : 'images were'} saved to this draft.`,
+      );
+    } catch (selectionError) {
+      setError(errorMessage(selectionError));
+    } finally {
+      imageActionLocked.current = false;
+      setProcessing(false);
+      setProcessingProgress(null);
+    }
+  };
+
+  const removeDraftImage = async (imageId: string) => {
+    if (!draftId || saving || processing) {
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await reportRepository.removeImage(draftId, imageId);
+      await refreshReports();
+      setNotice('Image removed from this draft.');
+    } catch (removeError) {
+      setError(errorMessage(removeError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const openAppSettings = async () => {
+    try {
+      await Linking.openSettings();
+    } catch (settingsError) {
+      setError(errorMessage(settingsError));
     }
   };
 
@@ -191,25 +324,97 @@ function App() {
             />
             <View style={styles.imageNotice}>
               <Text style={styles.imageCount}>
-                {imageCount} {imageCount === 1 ? 'image' : 'images'} attached
+                {imageCount} / {MAX_REPORT_IMAGES} images
               </Text>
               <Text style={styles.imageLimitation}>
-                Image selection is not available yet. Reports need 1–5 images
-                before they can be queued.
+                {draftId
+                  ? 'Images are resized as needed and saved privately on this device.'
+                  : 'Save a draft locally before adding photos.'}
               </Text>
             </View>
+            {processing ? (
+              <View style={styles.processingNotice} accessibilityRole="progressbar">
+                <ActivityIndicator color="#397B68" />
+                <Text style={styles.processingText}>
+                  {processingProgress
+                    ? `Processing image ${Math.min(processingProgress.completed + 1, processingProgress.total)} of ${processingProgress.total}…`
+                    : 'Opening image source…'}
+                </Text>
+              </View>
+            ) : null}
+            {cameraPermissionDenied ? (
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => openAppSettings()}
+                style={styles.settingsButton}>
+                <Text style={styles.settingsButtonText}>
+                  Open Settings to review app access
+                </Text>
+              </Pressable>
+            ) : null}
             <View style={styles.actions}>
               <Pressable
                 accessibilityRole="button"
-                disabled={saving || loading}
+                disabled={imageActionsDisabled}
+                onPress={() => selectImages('camera')}
+                style={({ pressed }) => [
+                  styles.secondaryButton,
+                  (imageActionsDisabled || pressed) && styles.buttonMuted,
+                ]}>
+                <Text style={styles.secondaryButtonText}>Take Photo</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                disabled={imageActionsDisabled}
+                onPress={() => selectImages('gallery')}
+                style={({ pressed }) => [
+                  styles.secondaryButton,
+                  (imageActionsDisabled || pressed) && styles.buttonMuted,
+                ]}>
+                <Text style={styles.secondaryButtonText}>
+                  Choose from Gallery
+                </Text>
+              </Pressable>
+            </View>
+            {currentDraft?.images.map(image => (
+              <View key={image.localId} style={styles.imageRow}>
+                <Image
+                  accessibilityLabel={image.originalFileName ?? 'Attached report image'}
+                  source={{ uri: asFileUri(image.filePath) }}
+                  style={styles.thumbnail}
+                />
+                <View style={styles.imageDetails}>
+                  <Text numberOfLines={1} style={styles.imageFileName}>
+                    {image.originalFileName ?? `Image ${image.orderIndex + 1}`}
+                  </Text>
+                  <Text style={styles.imageSize}>
+                    {(image.sizeBytes / (1024 * 1024)).toFixed(2)} MiB
+                  </Text>
+                </View>
+                <Pressable
+                  accessibilityLabel={`Remove ${image.originalFileName ?? `image ${image.orderIndex + 1}`}`}
+                  accessibilityRole="button"
+                  disabled={saving || processing}
+                  onPress={() => removeDraftImage(image.localId)}
+                  style={styles.removeImageButton}>
+                  <Text style={styles.removeImageLabel}>Remove</Text>
+                </Pressable>
+              </View>
+            ))}
+            <View style={styles.actions}>
+              <Pressable
+                accessibilityRole="button"
+                disabled={formBusy}
                 onPress={() => saveDraft()}
                 style={({ pressed }) => [
                   styles.primaryButton,
-                  (pressed || saving || loading) && styles.buttonMuted,
+                  (pressed || formBusy) && styles.buttonMuted,
                 ]}>
                 <Text style={styles.primaryButtonText}>
-                  {saving
-                    ? 'Saving…'
+                  {saving || processing
+                    ? processing
+                      ? 'Processing…'
+                      : 'Saving…'
                     : draftId
                       ? 'Save draft locally'
                       : 'Create draft locally'}
@@ -217,17 +422,16 @@ function App() {
               </Pressable>
               <Pressable
                 accessibilityRole="button"
-                disabled={!canQueue || saving || loading}
+                disabled={queueDisabled}
                 onPress={() => queueDraft()}
                 style={({ pressed }) => [
                   styles.secondaryButton,
-                  (!canQueue || saving || loading || pressed) &&
-                    styles.buttonMuted,
+                  (queueDisabled || pressed) && styles.buttonMuted,
                 ]}>
                 <Text
                   style={[
                     styles.secondaryButtonText,
-                    (!canQueue || saving || loading) && styles.disabledText,
+                    queueDisabled && styles.disabledText,
                   ]}>
                   Queue report
                 </Text>
@@ -455,6 +659,64 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
   },
+  processingNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    marginTop: 13,
+  },
+  processingText: {
+    flex: 1,
+    color: '#397B68',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  settingsButton: {
+    alignSelf: 'flex-start',
+    paddingTop: 12,
+  },
+  settingsButtonText: {
+    color: '#A73D35',
+    fontSize: 12,
+    fontWeight: '700',
+    textDecorationLine: 'underline',
+  },
+  imageRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 12,
+    padding: 9,
+    borderRadius: 11,
+    backgroundColor: '#F6F8F7',
+  },
+  thumbnail: {
+    width: 52,
+    height: 52,
+    borderRadius: 8,
+    backgroundColor: '#E1E9E5',
+  },
+  imageDetails: {
+    flex: 1,
+  },
+  imageFileName: {
+    color: '#18332E',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  imageSize: {
+    marginTop: 4,
+    color: '#71807B',
+    fontSize: 11,
+  },
+  removeImageButton: {
+    padding: 7,
+  },
+  removeImageLabel: {
+    color: '#A73D35',
+    fontSize: 11,
+    fontWeight: '700',
+  },
   actions: {
     marginTop: 15,
     gap: 9,
@@ -597,6 +859,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error
     ? error.message
     : 'An unexpected local storage error occurred.';
+}
+
+function asFileUri(path: string): string {
+  return path.startsWith('file://') ? path : `file://${path}`;
 }
 
 export default App;
